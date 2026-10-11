@@ -1,6 +1,7 @@
 'use strict';
 
 const KEY = 'enfoque-diario-v1';
+const WORK_COLOR = '#d9822b';
 
 const AREAS = {
   negocio: { name: 'Negocio', color: '#e0892b' },
@@ -11,18 +12,13 @@ const AREAS = {
 };
 
 const DEFAULTS = () => ({
-  settings: { pomo: 25, brk: 5, sleepH: 8, routineH: 2, remindBefore: 5, reviewTime: '21:30' },
-  shiftTypes: [
-    { id: 'm', name: 'Mañana', start: '06:00', end: '14:00', color: '#d9822b' },
-    { id: 't', name: 'Tarde', start: '14:00', end: '22:00', color: '#4a7fd6' },
-    { id: 'n', name: 'Noche', start: '22:00', end: '06:00', color: '#5a4fb0' },
-    { id: 'l', name: 'Libre', start: '', end: '', color: '#3fa66b' }
-  ],
-  days: {},        // 'YYYY-MM-DD' -> id de turno
-  activities: [],  // {id,date,start,end,title,area,goalId,done,doneAt,focusMin}
-  goals: [],       // {id,title,area,weeklyMin,deadline,why}
+  settings: { pomo: 25, brk: 5, wake: '08:00', bed: '23:30', routineH: 2, remindBefore: 5, reviewTime: '21:30' },
+  days: {},        // 'YYYY-MM-DD' -> tramos de trabajo programados [{start,end}]
+  clock: {},       // fecha de entrada -> registros reales [{in:'HH:MM', out:'HH:MM'}]
+  routines: [],    // compromisos fijos: {id,title,start,end,weekdays}
+  activities: [],  // {id,date,start,end,title,area,goalId,done,doneAt,focusMin,auto}
+  goals: [],       // {id,title,area,weeklyMin,deadline,why,steps:[{id,title,due,done}]}
   looseFocus: [],  // foco sin actividad: {date,min,goalId,area}
-  clock: {},       // fecha de entrada -> {in:'HH:MM', out:'HH:MM'} (registro real)
   reviews: {},     // fecha -> {good,blocked,tomorrow,energy}
   pomos: {},       // fecha -> pomodoros completados
   fired: { date: '', keys: {} },
@@ -31,11 +27,27 @@ const DEFAULTS = () => ({
 
 /* ---------- utilidades ---------- */
 
+// Convierte datos guardados por versiones anteriores (un solo turno por día, tipos de turno).
+function migrate(s) {
+  const types = s.shiftTypes || [];
+  Object.keys(s.days).forEach(d => {
+    let v = s.days[d];
+    if (typeof v === 'string') {
+      const t = types.find(x => x.id === v);
+      v = t && t.start && t.end ? [{ start: t.start, end: t.end }] : [];
+    } else if (!Array.isArray(v)) v = [{ start: v.start, end: v.end }];
+    if (v.length) s.days[d] = v; else delete s.days[d];
+  });
+  Object.keys(s.clock).forEach(d => { if (!Array.isArray(s.clock[d])) s.clock[d] = [s.clock[d]]; });
+  s.goals.forEach(g => { g.steps = g.steps || []; });
+  delete s.shiftTypes;
+  return s;
+}
 function load() {
   const base = DEFAULTS();
   try {
     const saved = JSON.parse(localStorage.getItem(KEY) || 'null');
-    if (saved) return { ...base, ...saved, settings: { ...base.settings, ...saved.settings } };
+    if (saved) return migrate({ ...base, ...saved, settings: { ...base.settings, ...saved.settings } });
   } catch (e) { /* datos corruptos: se empieza de cero */ }
   return base;
 }
@@ -64,70 +76,104 @@ function fmtDur(m) {
 function fmtDate(s, opts) { return parseYmd(s).toLocaleDateString('es', opts); }
 
 let state = load();
-const ui = { tab: 'dia', date: today(), month: today().slice(0, 7), week: weekStart(today()), paint: null };
+const ui = { tab: 'dia', date: today(), month: today().slice(0, 7), week: weekStart(today()), ocr: false };
 
 function toast(msg) {
   const t = $('#toast');
   t.textContent = msg;
   t.classList.add('show');
   clearTimeout(toast.h);
-  toast.h = setTimeout(() => t.classList.remove('show'), 4000);
+  toast.h = setTimeout(() => t.classList.remove('show'), 4500);
 }
 
 /* ---------- cálculos ---------- */
 
-const shiftById = id => state.shiftTypes.find(s => s.id === id);
-// Un día guarda el id de un turno o un horario propio {start,end} cargado desde el horario semanal.
-function shiftOn(date) {
-  const v = state.days[date];
-  if (!v) return undefined;
-  return typeof v === 'string' ? shiftById(v) : { name: `${v.start}–${v.end}`, color: '#d9822b', ...v };
-}
-const hasHours = s => s && s.start && s.end;
-const clockDur = c => { const a = toMin(c.in), b = toMin(c.out); return b >= a ? b - a : b + 1440 - a; };
-const clockDone = c => c && c.in && c.out;
-// Entrada marcada sin salida (hoy, o ayer si el turno cruza la medianoche).
-const openClock = () => [today(), addDays(today(), -1)].find(d => state.clock[d] && state.clock[d].in && !state.clock[d].out);
-// Minutos que sueles trabajar de más respecto al turno programado (últimas 4 semanas).
-function avgLate() {
-  const from = addDays(today(), -28);
-  const xs = Object.keys(state.clock)
-    .filter(d => d >= from && clockDone(state.clock[d]) && hasHours(shiftOn(d)))
-    .map(d => clockDur(state.clock[d]) - shiftDur(shiftOn(d)));
-  return xs.length ? Math.max(0, Math.round(xs.reduce((a, b) => a + b, 0) / xs.length)) : 0;
-}
-function shiftDur(s) {
-  if (!hasHours(s)) return 0;
-  const a = toMin(s.start), b = toMin(s.end);
-  return b > a ? b - a : b + 1440 - a;
-}
+// Duración de un tramo {start,end}; si el fin no es posterior al inicio, cruza la medianoche.
+const span = s => { const a = toMin(s.start), b = toMin(s.end); return b > a ? b - a : b + 1440 - a; };
+const crosses = s => toMin(s.end) <= toMin(s.start);
+const shiftsOn = date => state.days[date] || [];
+const schedMin = date => shiftsOn(date).reduce((t, s) => t + span(s), 0);
 
-// Tramos de trabajo dentro de un día, incluido lo que arrastra un turno de noche del día anterior.
+// Tramos de trabajo dentro de un día, incluido lo que arrastra un turno que empezó la víspera.
 function workIntervals(date) {
   const out = [];
-  const prev = shiftOn(addDays(date, -1));
-  if (hasHours(prev) && toMin(prev.end) <= toMin(prev.start) && toMin(prev.end) > 0) {
-    out.push({ start: 0, end: toMin(prev.end), name: prev.name, color: prev.color });
-  }
-  const s = shiftOn(date);
-  if (hasHours(s)) {
-    const a = toMin(s.start), b = toMin(s.end);
-    out.push({ start: a, end: b > a ? b : 1440, name: s.name, color: s.color });
-  }
+  shiftsOn(addDays(date, -1)).forEach(s => { if (crosses(s) && toMin(s.end) > 0) out.push({ start: 0, end: toMin(s.end) }); });
+  shiftsOn(date).forEach(s => out.push({ start: toMin(s.start), end: crosses(s) ? 1440 : toMin(s.end) }));
+  return out.sort((a, b) => a.start - b.start);
+}
+function routinesOn(date) {
+  const wd = parseYmd(date).getDay();
+  return state.routines.filter(r => !r.weekdays || (wd >= 1 && wd <= 5))
+    .map(r => ({ start: toMin(r.start), end: toMin(r.start) + span(r), title: r.title }));
+}
+// Ventana en la que estás despierto ese día (hasta la medianoche como máximo).
+function awake() {
+  const lo = toMin(state.settings.wake), b = toMin(state.settings.bed);
+  return { lo, hi: b <= lo ? 1440 : b };
+}
+function merged(list, lo, hi) {
+  const out = [];
+  list.map(i => ({ start: Math.max(lo, i.start), end: Math.min(hi, i.end) })).filter(i => i.end > i.start)
+    .sort((a, b) => a.start - b.start)
+    .forEach(i => {
+      const last = out[out.length - 1];
+      if (last && i.start <= last.end) last.end = Math.max(last.end, i.end); else out.push(i);
+    });
   return out;
 }
 
-function dur(a) { const s = toMin(a.start), e = toMin(a.end); return e > s ? e - s : e + 1440 - s; }
+const dur = span;
 function actsOn(date) {
   return state.activities.filter(a => a.date === date).sort((a, b) => toMin(a.start) - toMin(b.start));
 }
 function freeMin(date) {
-  const work = workIntervals(date).reduce((t, w) => t + w.end - w.start, 0);
-  return Math.max(0, 1440 - (state.settings.sleepH + state.settings.routineH) * 60 - work);
+  const { lo, hi } = awake();
+  const busy = merged([...workIntervals(date), ...routinesOn(date)], lo, hi).reduce((t, i) => t + i.end - i.start, 0);
+  return Math.max(0, hi - lo - busy - state.settings.routineH * 60);
 }
+
+const clockList = date => state.clock[date] || [];
+const clockDur = c => { const a = toMin(c.in), b = toMin(c.out); return b >= a ? b - a : b + 1440 - a; };
+const clockDone = c => c.in && c.out;
+const workedMin = date => clockList(date).filter(clockDone).reduce((t, c) => t + clockDur(c), 0);
+// Entrada marcada sin salida (hoy, o ayer si el turno cruza la medianoche).
+function openClock() {
+  for (const d of [today(), addDays(today(), -1)]) {
+    const c = clockList(d).find(x => x.in && !x.out);
+    if (c) return { d, c };
+  }
+  return null;
+}
+// Minutos que sueles trabajar de más al día respecto a lo programado (últimas 4 semanas, días con registro completo).
+function avgLate() {
+  const from = addDays(today(), -28);
+  const xs = Object.keys(state.clock)
+    .filter(d => d >= from && schedMin(d) > 0 && clockList(d).filter(clockDone).length >= shiftsOn(d).length)
+    .map(d => workedMin(d) - schedMin(d));
+  return xs.length ? Math.max(0, Math.round(xs.reduce((a, b) => a + b, 0) / xs.length)) : 0;
+}
+
+// Huecos libres de al menos 30 min mientras estás despierto: sin trabajo (con tu retraso habitual), rutinas ni actividades.
+function freeSlots(date) {
+  if (date < today()) return [];
+  const { lo, hi } = awake(), work = workIntervals(date);
+  const late = Math.round(avgLate() / Math.max(1, work.length));
+  const from = date === today() ? Math.max(lo, Math.ceil((nowMin() + 1) / 5) * 5) : lo;
+  const busy = merged([
+    ...work.map(w => ({ start: w.start, end: w.end + late })),
+    ...routinesOn(date),
+    ...actsOn(date).map(a => ({ start: toMin(a.start), end: toMin(a.start) + dur(a) + 10 }))
+  ], from, hi);
+  const out = [];
+  let t = from;
+  busy.forEach(b => { if (b.start - t >= 30) out.push({ start: t, end: b.start }); t = Math.max(t, b.end); });
+  if (hi - t >= 30) out.push({ start: t, end: hi });
+  return out;
+}
+
 function endTime(a) {
-  const d = parseYmd(a.date), s = toMin(a.start), e = toMin(a.end);
-  d.setMinutes(e > s ? e : e + 1440);
+  const d = parseYmd(a.date);
+  d.setMinutes(toMin(a.start) + dur(a));
   return d.getTime();
 }
 // Cumplida "a tiempo" = marcada antes de 30 min después de la hora de fin.
@@ -164,20 +210,35 @@ function mostBehindGoal() {
     .filter(x => x.left > 0)
     .sort((a, b) => b.left / b.g.weeklyMin - a.left / a.g.weeklyMin)[0];
 }
-// Primer hueco libre de al menos 30 min (sin trabajo ni actividades) entre las 06:00 y las 23:00.
-function findSlot(date) {
-  const late = avgLate();
-  const busy = [...workIntervals(date).map(w => ({ start: w.start, end: w.end + late })), ...actsOn(date).map(a => ({ start: toMin(a.start), end: toMin(a.start) + dur(a) }))]
-    .sort((a, b) => a.start - b.start);
-  let t = 360;
-  if (date === today()) t = Math.max(t, Math.ceil((nowMin() + 1) / 5) * 5);
-  for (const b of busy) {
-    if (b.start - t >= 30) break;
-    t = Math.max(t, b.end);
+
+// Reparte las horas semanales de cada meta en los huecos libres de la semana: un bloque de hasta 90 min por meta y día.
+function autoPlan(ws) {
+  const t = today();
+  const left = state.goals.map(g => ({
+    g,
+    left: g.weeklyMin - goalMinutes(g.id, ws)
+      - state.activities.filter(a => a.goalId === g.id && !a.done && inWeek(a.date, ws) && a.date >= t).reduce((s, a) => s + dur(a), 0)
+  }));
+  let n = 0;
+  for (let i = 0; i < 7; i++) {
+    const d = addDays(ws, i);
+    if (d < t) continue;
+    left.sort((a, b) => b.left - a.left);
+    for (const x of left) {
+      if (x.left < 30 || state.activities.some(a => a.date === d && a.goalId === x.g.id)) continue;
+      const slot = freeSlots(d)[0];
+      if (!slot) break;
+      const len = Math.floor(Math.min(90, x.left, slot.end - slot.start) / 5) * 5;
+      if (len < 30) continue;
+      state.activities.push({
+        id: uid(), date: d, start: toHM(slot.start), end: toHM(slot.start + len), title: x.g.title,
+        area: x.g.area, goalId: x.g.id, done: false, doneAt: null, focusMin: 0, auto: true
+      });
+      x.left -= len;
+      n++;
+    }
   }
-  const next = busy.find(b => b.start >= t);
-  const gap = Math.min(next ? next.start : 1380, 1380) - t;
-  return gap >= 30 ? { start: t, end: t + Math.min(gap, 60) } : null;
+  return n;
 }
 
 /* ---------- captura del horario semanal ---------- */
@@ -185,21 +246,132 @@ function findSlot(date) {
 // Las capturas van aparte del estado (una por semana) para no engordar la copia de seguridad.
 const SHOT = 'enfoque-shot-';
 function getShot(ws) { try { return localStorage.getItem(SHOT + ws); } catch (e) { return null; } }
-function saveShot(file) {
-  const img = new Image();
-  img.onload = () => {
-    const k = Math.min(1, 1400 / Math.max(img.width, img.height));
+
+async function ocrWords(img) {
+  if (!window.Tesseract) {
+    await new Promise((res, rej) => {
+      const s = document.createElement('script');
+      s.src = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';
+      s.onload = res; s.onerror = rej;
+      document.head.appendChild(s);
+    });
+  }
+  // Tres pasadas (distinta segmentación y tamaño) que votan cada palabra: una sola pasada
+  // a veces se salta una celda o confunde un dígito (11:00 por 01:00).
+  const worker = await Tesseract.createWorker('spa');
+  const max = Math.max(img.width, img.height), base = Math.min(1, 2000 / max);
+  const cells = [];
+  for (const [mult, psm] of [[1, '6'], [1, '11'], [2, '11']]) {
+    const k = Math.min(base * mult, 3200 / max);
     const c = document.createElement('canvas');
     c.width = Math.round(img.width * k);
     c.height = Math.round(img.height * k);
     c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+    await worker.setParameters({ tessedit_pageseg_mode: psm });
+    const { data } = await worker.recognize(c);
+    data.words.forEach(w => {
+      const b = { x0: w.bbox.x0 / k, y0: w.bbox.y0 / k, x1: w.bbox.x1 / k, y1: w.bbox.y1 / k };
+      const tol = (b.y1 - b.y0) * 0.6;
+      let cell = cells.find(o => Math.abs(o.bbox.x0 - b.x0) < tol && Math.abs(o.bbox.y0 - b.y0) < tol);
+      if (!cell) cells.push(cell = { bbox: b, votes: {} });
+      cell.votes[w.text] = (cell.votes[w.text] || 0) + 1;
+    });
+  }
+  await worker.terminate();
+  return cells.map(c => ({ bbox: c.bbox, text: Object.keys(c.votes).sort((a, b) => c.votes[b] - c.votes[a])[0] }));
+}
+
+// Lee una tabla "día | hora de inicio | hora de fin" a partir de las palabras reconocidas y su posición.
+// Devuelve { 'YYYY-MM-DD': [{start,end}] }.
+function parseSchedule(words) {
+  const WD = ['domingo', 'lunes', 'martes', 'miercoles', 'jueves', 'viernes', 'sabado'];
+  const items = words.map(w => ({
+    t: w.text.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/[^a-z0-9:.]/g, ''),
+    x: w.bbox.x0, y: (w.bbox.y0 + w.bbox.y1) / 2, h: w.bbox.y1 - w.bbox.y0
+  }));
+  const times = items.map(i => {
+    const m = i.t.match(/^(\d{1,2})[:.](\d{2})$/);
+    return m && +m[1] < 24 && +m[2] < 60 ? { ...i, v: `${pad(+m[1])}:${m[2]}` } : null;
+  }).filter(Boolean).sort((a, b) => a.y - b.y);
+
+  // Filas = horas a la misma altura; solo cuentan las que tienen inicio y fin.
+  const rows = [];
+  times.forEach(tm => {
+    const row = rows[rows.length - 1];
+    if (row && Math.abs(row[0].y - tm.y) < tm.h * 0.8) row.push(tm); else rows.push([tm]);
+  });
+  const pairs = rows.filter(r => r.length === 2).map(r => r.sort((a, b) => a.x - b.x));
+  if (!pairs.length) return {};
+  const colX = Math.min(...pairs.map(r => r[0].x));
+
+  // Cada día de la semana escrito a la izquierda, con el número de día más cercano (puede estar en la línea siguiente).
+  const nums = items.filter(i => /^\d{1,2}$/.test(i.t) && +i.t >= 1 && +i.t <= 31 && i.x < colX);
+  const labels = items.filter(i => i.x < colX).map(i => {
+    const wd = WD.findIndex(n => i.t.startsWith(n));
+    if (wd < 0) return null;
+    const num = nums.filter(n => n.y > i.y - i.h && n.y < i.y + i.h * 2.5)
+      .sort((a, b) => Math.abs(a.y - i.y) - Math.abs(b.y - i.y))[0];
+    if (!num) return null;
+    // La fecha real es la más cercana a hoy con ese día de la semana y ese número.
+    for (let k = -10; k <= 40; k++) {
+      const d = parseYmd(addDays(today(), k));
+      if (d.getDay() === wd && d.getDate() === +num.t) return { y: i.y, date: ymd(d) };
+    }
+    return null;
+  }).filter(Boolean);
+
+  const out = {};
+  pairs.forEach(([a, b]) => {
+    const lab = labels.slice().sort((p, q) => Math.abs(p.y - a.y) - Math.abs(q.y - a.y))[0];
+    if (!lab || Math.abs(lab.y - a.y) > a.h * 3 || a.v === b.v) return;
+    (out[lab.date] = out[lab.date] || []).push({ start: a.v, end: b.v });
+  });
+  // Un turno partido por la medianoche (…–00:00 y 00:00–… al día siguiente) se une en uno solo.
+  Object.keys(out).sort().forEach(d => {
+    const next = out[addDays(d, 1)];
+    out[d].forEach(s => {
+      const i = s.end === '00:00' && next ? next.findIndex(n => n.start === '00:00') : -1;
+      if (i >= 0) { s.end = next[i].end; next.splice(i, 1); }
+    });
+    out[d].sort((p, q) => toMin(p.start) - toMin(q.start));
+  });
+  Object.keys(out).forEach(d => { if (!out[d].length) delete out[d]; });
+  return out;
+}
+
+function saveShot(file) {
+  const img = new Image();
+  img.onload = async () => {
+    const k = Math.min(1, 1600 / Math.max(img.width, img.height));
+    const c = document.createElement('canvas');
+    c.width = Math.round(img.width * k);
+    c.height = Math.round(img.height * k);
+    c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+    const data = c.toDataURL('image/jpeg', 0.8);
+
+    ui.ocr = true; render();
+    let msg = 'Captura guardada. No pude leer las horas; cópialas a mano abajo.';
+    try {
+      const found = parseSchedule(await ocrWords(img)), dates = Object.keys(found).sort();
+      if (dates.length) {
+        dates.forEach(d => { state.days[d] = found[d]; });
+        ui.week = weekStart(dates[0]);
+        ui.month = dates[0].slice(0, 7);
+        const odd = dates.some(d => found[d].some(s => span(s) > 600));
+        msg = `Leí ${dates.reduce((t, d) => t + found[d].length, 0)} tramos en ${dates.length} días. `
+          + (odd ? 'Hay un tramo de más de 10 h: seguramente leí mal una hora, corrígela abajo.' : 'Revísalos abajo y corrige si hace falta.');
+        save();
+      }
+    } catch (e) { msg = 'Captura guardada. La lectura automática necesita conexión a internet; copia las horas a mano.'; }
+    ui.ocr = false;
     URL.revokeObjectURL(img.src);
+
     try {
       const limit = SHOT + addDays(weekStart(today()), -35);
       Object.keys(localStorage).filter(x => x.startsWith(SHOT) && x < limit).forEach(x => localStorage.removeItem(x));
-      localStorage.setItem(SHOT + ui.week, c.toDataURL('image/jpeg', 0.8));
-      toast('Captura guardada. Copia las horas abajo.');
-    } catch (e) { toast('No hay espacio para guardar la captura'); }
+      localStorage.setItem(SHOT + ui.week, data);
+    } catch (e) { msg = 'No hay espacio para guardar la captura'; }
+    toast(msg);
     render();
   };
   img.onerror = () => toast('No se pudo leer la imagen');
@@ -250,6 +422,13 @@ function checkAlarms() {
     }
     if (now >= s && now < s + 10 && !keys[a.id + ':go']) {
       fire(a.id + ':go', `Ahora: ${a.title}`, `${a.start}–${a.end}. Empieza ya, aunque sean 5 minutos.`);
+    }
+  });
+
+  shiftsOn(d).forEach(s => {
+    const m = toMin(s.start);
+    if (now >= m - 30 && now < m && !keys['w' + s.start]) {
+      fire('w' + s.start, `Trabajo en ${m - now} min`, `Tu tramo es de ${s.start} a ${s.end}.`);
     }
   });
 
@@ -316,27 +495,31 @@ function tick() {
 
 /* ---------- vistas ---------- */
 
-const areaChip = k => `<span class="chip"><i style="background:${AREAS[k]?.color || AREAS.otro.color}"></i>${AREAS[k]?.name || 'Otro'}</span>`;
+const areaColor = k => (AREAS[k] || AREAS.otro).color;
+const areaChip = k => `<span class="chip"><i style="background:${areaColor(k)}"></i>${(AREAS[k] || AREAS.otro).name}</span>`;
 const bar = (pct, color) => `<div class="bar"><i style="width:${Math.min(100, Math.round(pct * 100))}%;${color ? `background:${color}` : ''}"></i></div>`;
+const shortT = t => (t.endsWith(':00') ? String(+t.slice(0, 2)) : +t.slice(0, 2) + t.slice(2));
 
 function viewDia() {
   const d = ui.date, isToday = d === today(), now = nowMin();
-  const acts = actsOn(d), work = workIntervals(d);
+  const acts = actsOn(d), shifts = shiftsOn(d);
   const free = freeMin(d), planned = acts.reduce((t, a) => t + dur(a), 0);
-  const score = dayScore(d), cur = state.days[d];
-  const sh = shiftOn(d), ck = state.clock[d] || {}, open = openClock(), late = avgLate();
-  const extra = clockDone(ck) && hasHours(sh) ? clockDur(ck) - shiftDur(sh) : 0;
+  const score = dayScore(d), recs = clockList(d), open = openClock(), late = avgLate();
+  const worked = workedMin(d), sched = schedMin(d);
+  const extra = worked && sched && recs.filter(clockDone).length >= shifts.length ? worked - sched : 0;
 
   const items = [
-    ...work.map(w => ({ start: w.start, html: `<li class="work" style="border-left-color:${w.color}">
-        <span class="time">${toHM(w.start)}–${toHM(w.end)}</span><span class="t grow">Trabajo · ${esc(w.name)}</span></li>` })),
+    ...workIntervals(d).map(w => ({ start: w.start, html: `<li class="work" style="border-left-color:${WORK_COLOR}">
+        <span class="time">${toHM(w.start)}–${toHM(w.end)}</span><span class="t grow">Trabajo</span></li>` })),
+    ...routinesOn(d).map(r => ({ start: r.start, html: `<li class="work">
+        <span class="time">${toHM(r.start)}–${toHM(r.end)}</span><span class="t grow">${esc(r.title)}</span></li>` })),
     ...acts.map(a => {
       const s = toMin(a.start), e = s + dur(a);
-      const late = !a.done && (d < today() || (isToday && now >= e));
+      const lateAct = !a.done && (d < today() || (isToday && now >= e));
       const live = !a.done && isToday && now >= s && now < e;
       const tag = a.done ? (onTime(a) ? '<span class="tag ok">Cumplida a tiempo</span>' : '<span class="tag warn">Cumplida tarde</span>')
-        : late ? '<span class="tag bad">Atrasada</span>' : live ? '<span class="tag now">Ahora</span>' : '';
-      return { start: s, html: `<li class="${a.done ? 'done' : ''} ${live ? 'now' : ''}" style="border-left-color:${AREAS[a.area]?.color || AREAS.otro.color}">
+        : lateAct ? '<span class="tag bad">Atrasada</span>' : live ? '<span class="tag now">Ahora</span>' : '';
+      return { start: s, html: `<li class="${a.done ? 'done' : ''} ${live ? 'now' : ''}" style="border-left-color:${areaColor(a.area)}">
         <input type="checkbox" data-act="toggle" data-id="${a.id}" ${a.done ? 'checked' : ''} aria-label="Marcar cumplida">
         <div class="grow"><div class="t">${esc(a.title)}</div>
           <div class="row small"><span class="time">${a.start}–${a.end}</span>${tag}${a.focusMin ? `<span class="muted">· ${fmtDur(a.focusMin)} de foco</span>` : ''}</div></div>
@@ -367,24 +550,26 @@ function viewDia() {
   </section>
 
   <section class="card">
-    <h2>Turno de trabajo</h2>
-    <div class="row">
-      ${state.shiftTypes.map(s => `<button class="chip ${cur === s.id ? 'on' : ''}" data-act="set-shift" data-id="${s.id}">
-        <i style="background:${s.color}"></i>${esc(s.name)}${hasHours(s) ? ` ${s.start}–${s.end}` : ''}</button>`).join('')}
+    <div class="row between">
+      <h2 style="margin:0">Trabajo</h2>
+      <button class="btn mini" data-act="edit-week">Editar horario</button>
     </div>
-    ${hasHours(sh) && typeof cur !== 'string' ? `<p class="small" style="margin:8px 0 0">Horario de esta semana: <b>${sh.start}–${sh.end}</b></p>` : ''}
-    ${cur ? '' : '<p class="small muted" style="margin:8px 0 0">Elige tu turno, o carga el horario de toda la semana en Calendario.</p>'}
+    <p class="small" style="margin:8px 0 0">${shifts.length
+      ? `Programado: ${shifts.map(s => `<b>${s.start}–${s.end}</b>`).join(' · ')} (${fmtDur(sched)})`
+      : '<span class="muted">Sin turno programado este día.</span>'}</p>
     <hr>
     <div class="row between">
-      <span class="small">${ck.in ? `Entrada <b>${ck.in}</b>${ck.out ? ` · Salida <b>${ck.out}</b> · Trabajado <b>${fmtDur(clockDur(ck))}</b>` : ' · en curso'}` : 'Sin registro real de este día'}
+      <span class="small">${recs.length
+        ? `Real: ${recs.map(c => `<b>${c.in}–${c.out || '…'}</b>`).join(' · ')}${worked ? ` (${fmtDur(worked)})` : ''}`
+        : 'Sin registro real de este día'}
         ${extra > 0 ? `<span class="tag warn"> +${fmtDur(extra)} extra</span>` : ''}</span>
       <span class="row">
-        ${isToday && !ck.in && !open ? '<button class="btn mini primary" data-act="clock-in">Marcar entrada</button>' : ''}
-        ${open && (isToday || open === d) ? `<button class="btn mini primary" data-act="clock-out" data-d="${open}">Marcar salida</button>` : ''}
+        ${isToday && !open ? '<button class="btn mini primary" data-act="clock-in">Marcar entrada</button>' : ''}
+        ${open && (isToday || open.d === d) ? '<button class="btn mini primary" data-act="clock-out">Marcar salida</button>' : ''}
         <button class="btn mini" data-act="edit-clock">Editar</button>
       </span>
     </div>
-    ${late >= 10 ? `<p class="small muted" style="margin:8px 0 0">Sueles trabajar unos ${fmtDur(late)} más de lo programado; lo tengo en cuenta al proponerte bloques.</p>` : ''}
+    ${late >= 10 ? `<p class="small muted" style="margin:8px 0 0">Sueles trabajar unos ${fmtDur(late)} más al día de lo programado; lo tengo en cuenta al proponerte bloques.</p>` : ''}
   </section>
 
   <section class="card">
@@ -407,24 +592,28 @@ function viewDia() {
 
 function viewCal() {
   const [y, m] = ui.month.split('-').map(Number);
-  const first = `${ui.month}-01`, start = weekStart(first), t = today();
+  const start = weekStart(`${ui.month}-01`), t = today();
   let cells = '';
   for (let i = 0; i < 42; i++) {
-    const d = addDays(start, i), s = shiftOn(d), sc = dayScore(d);
+    const d = addDays(start, i), sc = dayScore(d);
     cells += `<button class="${d.slice(0, 7) !== ui.month ? 'out' : ''} ${d === t ? 'today' : ''}" data-act="cal-day" data-d="${d}">
       <b>${Number(d.slice(8))}</b>
-      ${s ? `<span class="sh" style="background:${s.color}">${esc(s.name)}</span>` : ''}
+      ${shiftsOn(d).slice(0, 2).map(s => `<span class="sh" style="background:${WORK_COLOR}">${shortT(s.start)}–${shortT(s.end)}</span>`).join('')}
       ${sc.total ? `<span class="cnt">${sc.done}/${sc.total} ✓</span>` : ''}</button>`;
   }
+
   const wk = ui.week, shot = getShot(wk);
   let sched = 0, real = 0, extra = 0, rows = '';
   for (let i = 0; i < 7; i++) {
-    const d = addDays(wk, i), s = shiftOn(d), c = state.clock[d];
-    sched += shiftDur(s);
-    if (clockDone(c)) { real += clockDur(c); extra += clockDur(c) - shiftDur(s); }
-    rows += `<div class="wkrow"><span>${fmtDate(d, { weekday: 'short', day: 'numeric' })}</span>
-      <input type="time" name="s${i}" value="${hasHours(s) ? s.start : ''}" aria-label="Entrada">
-      <input type="time" name="e${i}" value="${hasHours(s) ? s.end : ''}" aria-label="Salida"></div>`;
+    const d = addDays(wk, i), list = shiftsOn(d), n = list.length < 2 ? 2 : list.length + 1;
+    sched += schedMin(d);
+    const w = workedMin(d);
+    if (w) { real += w; extra += w - schedMin(d); }
+    for (let j = 0; j < n; j++) {
+      rows += `<div class="wkrow"><span>${j ? '' : fmtDate(d, { weekday: 'short', day: 'numeric' })}</span>
+        <input type="time" name="s${i}_${j}" value="${list[j] ? list[j].start : ''}" aria-label="Inicio">
+        <input type="time" name="e${i}_${j}" value="${list[j] ? list[j].end : ''}" aria-label="Fin"></div>`;
+    }
   }
 
   return `
@@ -437,28 +626,22 @@ function viewCal() {
     <div class="cal">${['L', 'M', 'X', 'J', 'V', 'S', 'D'].map(w => `<div class="wd">${w}</div>`).join('')}${cells}</div>
   </section>
   <section class="card">
-    <h2>Cargar turnos rápido</h2>
-    <p class="small muted" style="margin-top:0">Elige un turno y toca los días del calendario para asignarlo. Sin turno elegido, tocar un día lo abre.</p>
-    <div class="row">
-      ${state.shiftTypes.map(s => `<button class="chip ${ui.paint === s.id ? 'on' : ''}" data-act="paint" data-id="${s.id}"><i style="background:${s.color}"></i>${esc(s.name)}</button>`).join('')}
-      <button class="chip ${ui.paint === 'x' ? 'on' : ''}" data-act="paint" data-id="x">Borrar</button>
-    </div>
-  </section>
-  <section class="card">
     <div class="daynav" style="margin-bottom:10px">
       <button class="btn mini" data-act="week" data-n="-1" aria-label="Semana anterior">‹</button>
       <strong>Horario de la semana del ${fmtDate(wk, { day: 'numeric', month: 'long' })}</strong>
       <button class="btn mini" data-act="week" data-n="1" aria-label="Semana siguiente">›</button>
     </div>
-    ${shot ? `<div class="shot"><img src="${shot}" alt="Captura del horario de la semana"></div>` : '<p class="small muted" style="margin-top:0">Sube la captura de tu horario (o pégala con Ctrl+V) para tenerla a la vista mientras copias las horas abajo.</p>'}
+    ${ui.ocr ? '<p class="small"><b>Leyendo el horario de la captura…</b> puede tardar unos segundos.</p>' : ''}
+    ${shot ? `<div class="shot"><img src="${shot}" alt="Captura del horario de la semana"></div>`
+      : '<p class="small muted" style="margin-top:0">Sube la captura de tu horario (o pégala con Ctrl+V): la app lee los días y las horas y rellena la tabla. Revisa siempre el resultado.</p>'}
     <div class="row" style="margin:8px 0 12px">
-      <button class="btn mini" data-act="shot-pick">${shot ? 'Cambiar captura' : 'Subir captura'}</button>
+      <button class="btn mini primary" data-act="shot-pick">${shot ? 'Cambiar captura' : 'Subir captura del horario'}</button>
       ${shot ? '<button class="btn mini danger" data-act="shot-del">Quitar captura</button>' : ''}
     </div>
     <form data-form="week">
-      <div class="wkrow small muted"><span>Día</span><span>Entrada</span><span>Salida</span></div>
+      <div class="wkrow small muted"><span>Día</span><span>Inicio</span><span>Fin</span></div>
       ${rows}
-      <p class="small muted" style="margin:0">Deja vacío el día que no trabajas.</p>
+      <p class="small muted" style="margin:0">Cada fila es un tramo. Deja vacías las que no uses.</p>
       <div class="actions"><button type="button" class="btn" data-act="copy-week">Copiar semana anterior</button>
         <button class="btn primary">Guardar semana</button></div>
     </form>
@@ -500,7 +683,7 @@ function viewFoco() {
   <section class="card">
     <h2>Empezar un bloque de foco</h2>
     <p class="small muted" style="margin-top:0">${set.pomo} min de concentración + ${set.brk} min de descanso. Elige una sola tarea.</p>
-    ${pending.length ? `<ul class="tl">${pending.map(a => `<li style="border-left-color:${AREAS[a.area]?.color || AREAS.otro.color}">
+    ${pending.length ? `<ul class="tl">${pending.map(a => `<li style="border-left-color:${areaColor(a.area)}">
       <div class="grow"><div class="t">${esc(a.title)}</div><span class="time">${a.start}–${a.end}</span></div>
       <button class="btn mini primary" data-act="focus" data-id="${a.id}">▶ Empezar</button></li>`).join('')}</ul>`
       : '<p class="small">No tienes actividades pendientes hoy.</p>'}
@@ -522,9 +705,15 @@ function viewMetas() {
   const t = today(), ws = weekStart(t), lastWs = addDays(ws, -7);
   const daysLeft = 7 - ((parseYmd(t).getDay() + 6) % 7);
   const round15 = m => Math.max(15, Math.round(m / 15) * 15);
+  const stepRow = (g, s) => `<label class="step ${s.done ? 'done' : ''}">
+    <input type="checkbox" data-act="step" data-id="${g.id}" data-step="${s.id}" ${s.done ? 'checked' : ''}>
+    <span class="grow">${esc(s.title)}</span>
+    ${s.due ? `<span class="tag ${!s.done && s.due < t ? 'bad' : ''}">${fmtDate(s.due, { day: 'numeric', month: 'short' })}</span>` : ''}</label>`;
+
   const cards = state.goals.map(g => {
     const done = goalMinutes(g.id, ws), left = Math.max(0, g.weeklyMin - done);
     const last = goalMinutes(g.id, lastWs), existedLastWeek = (g.created || t) < ws;
+    const next = g.steps.find(s => !s.done), stepsDone = g.steps.filter(s => s.done).length;
     let adj = '';
     if (existedLastWeek && last >= g.weeklyMin) {
       const up = round15(g.weeklyMin * 1.1);
@@ -539,19 +728,29 @@ function viewMetas() {
       <div class="row between"><h2 style="margin:0" class="grow">${esc(g.title)}</h2>${areaChip(g.area)}</div>
       ${g.why ? `<p class="small muted" style="margin:6px 0 0">Para qué: ${esc(g.why)}</p>` : ''}
       <p class="small" style="margin:10px 0 6px">Reto de esta semana: <b>${fmtDur(done)}</b> de ${fmtDur(g.weeklyMin)}</p>
-      ${bar(done / g.weeklyMin, AREAS[g.area]?.color)}
+      ${bar(done / g.weeklyMin, areaColor(g.area))}
       <p class="small" style="margin:8px 0 0">${left ? `Mini-meta de hoy: <b>${fmtDur(Math.ceil(left / daysLeft))}</b> (${daysLeft > 1 ? `quedan ${daysLeft} días` : 'último día'} de la semana).` : '<span class="tag ok">¡Reto semanal cumplido!</span>'}</p>
-      ${g.deadline ? `<p class="small muted" style="margin:4px 0 0">Fecha objetivo: ${fmtDate(g.deadline, { day: 'numeric', month: 'long', year: 'numeric' })}</p>` : ''}
+      ${g.steps.length ? `<hr><p class="small" style="margin:0 0 6px"><b>Siguiente paso</b> · ${stepsDone}/${g.steps.length} completados</p>
+        ${next ? stepRow(g, next) : '<span class="tag ok">¡Todos los pasos completados!</span>'}
+        <details><summary class="small muted">Ver todos los pasos</summary>${g.steps.map(s => stepRow(g, s)).join('')}</details>` : ''}
+      ${g.deadline ? `<p class="small muted" style="margin:8px 0 0">Fecha objetivo: ${fmtDate(g.deadline, { day: 'numeric', month: 'long', year: 'numeric' })}</p>` : ''}
       ${adj}
       <div class="actions"><button class="btn mini" data-act="edit-goal" data-id="${g.id}">Editar</button>
         <button class="btn mini primary" data-act="plan-goal" data-id="${g.id}">Planificar bloque</button></div>
     </section>`;
   }).join('');
 
+  const autos = state.activities.filter(a => a.auto && !a.done && a.date >= t).length;
   return `
   <section class="card">
     <div class="row between"><h2 style="margin:0">Mis metas</h2><button class="btn primary mini" data-act="new-goal">+ Meta</button></div>
-    <p class="small muted" style="margin:8px 0 0">Cada meta se convierte en un reto semanal de horas y en una mini-meta diaria. El avance sube al marcar actividades cumplidas o completar bloques de foco.</p>
+    <p class="small muted" style="margin:8px 0 0">Cada meta tiene un reto semanal de horas y pasos con fecha. El avance sube al marcar actividades cumplidas o completar bloques de foco.</p>
+    ${state.goals.length ? `<hr><p class="small" style="margin:0 0 8px">Repartir las horas de mis metas en mis huecos libres (bloques de hasta 90 min):</p>
+    <div class="row">
+      <button class="btn mini" data-act="auto-plan" data-n="0">Esta semana</button>
+      <button class="btn mini primary" data-act="auto-plan" data-n="1">La próxima semana</button>
+      ${autos ? `<button class="btn mini danger" data-act="auto-clear">Quitar ${autos} bloques automáticos</button>` : ''}
+    </div>` : ''}
   </section>
   ${cards || '<section class="card"><p class="small" style="margin:0">Empieza con una sola meta, la que más te acerque a tu propósito.</p></section>'}`;
 }
@@ -621,7 +820,7 @@ function actDialog(a) {
   const isNew = !a.id;
   openDlg(`<h2>${isNew ? 'Nueva actividad' : 'Editar actividad'}</h2>
   <form data-form="act" data-id="${a.id || ''}">
-    <label>Actividad<input name="title" required maxlength="80" value="${esc(a.title)}" placeholder="Ej. Estudiar inglés"></label>
+    <label>Actividad<input name="title" required maxlength="80" value="${esc(a.title)}" placeholder="Ej. Estudiar Python"></label>
     <label>Fecha<input type="date" name="date" required value="${a.date}"></label>
     <div class="two">
       <label>Inicio<input type="time" name="start" required value="${a.start}"></label>
@@ -642,19 +841,22 @@ function actDialog(a) {
 
 function newActDefaults(goal) {
   const date = ui.tab === 'dia' && ui.date >= today() ? ui.date : today();
-  const slot = findSlot(date) || { start: 1080, end: 1140 };
+  const free = freeSlots(date)[0];
+  const slot = free ? { start: free.start, end: Math.min(free.end, free.start + 60) } : { start: 1080, end: 1140 };
   return { date, start: toHM(slot.start), end: toHM(slot.end), title: goal ? goal.title : '', goalId: goal ? goal.id : '', area: goal ? goal.area : 'aprendizaje' };
 }
 
 function goalDialog(g) {
   const isNew = !g.id;
+  const steps = (g.steps || []).map(s => `${s.due ? s.due + ' ' : ''}${s.title}`).join('\n');
   openDlg(`<h2>${isNew ? 'Nueva meta' : 'Editar meta'}</h2>
   <form data-form="goal" data-id="${g.id || ''}">
-    <label>Meta<input name="title" required maxlength="80" value="${esc(g.title)}" placeholder="Ej. Hablar inglés nivel B2"></label>
+    <label>Meta<input name="title" required maxlength="80" value="${esc(g.title)}" placeholder="Ej. Aprender Python"></label>
     <label>Área<select name="area">${Object.keys(AREAS).filter(k => k !== 'otro').map(k => `<option value="${k}" ${g.area === k ? 'selected' : ''}>${AREAS[k].name}</option>`).join('')}</select></label>
     <label>Horas por semana que te comprometes a dedicar<input type="number" name="hours" required min="0.5" max="80" step="0.5" value="${(g.weeklyMin || 180) / 60}"></label>
     <label>Fecha objetivo (opcional)<input type="date" name="deadline" value="${g.deadline || ''}"></label>
     <label>¿Para qué la quieres lograr? (opcional)<input name="why" maxlength="140" value="${esc(g.why)}"></label>
+    <label>Pasos, uno por línea. Fecha opcional al inicio (AAAA-MM-DD)<textarea name="steps" rows="6" placeholder="2026-11-30 Terminar el curso básico">${esc(steps)}</textarea></label>
     <div class="actions">
       ${isNew ? '' : `<button type="button" class="btn danger" data-act="del-goal" data-id="${g.id}">Eliminar</button>`}
       <button type="button" class="btn" data-act="close">Cancelar</button>
@@ -668,22 +870,22 @@ function settingsDialog() {
   const perm = !('Notification' in window) ? 'no disponibles en este navegador' : { granted: 'activadas', denied: 'bloqueadas en el navegador', default: 'sin activar' }[Notification.permission];
   openDlg(`<h2>Ajustes</h2>
   <form data-form="settings">
-    <b class="small">Mis turnos</b>
-    ${state.shiftTypes.map((t, i) => `<div class="shrow">
-      <input name="n${i}" value="${esc(t.name)}" required maxlength="20" aria-label="Nombre del turno">
-      <input type="time" name="s${i}" value="${t.start}" aria-label="Inicio">
-      <input type="time" name="e${i}" value="${t.end}" aria-label="Fin">
-      <input type="color" name="c${i}" value="${t.color}" aria-label="Color">
-      <button type="button" class="icon-btn" data-act="del-shift" data-i="${i}" aria-label="Eliminar turno">✕</button></div>`).join('')}
-    <div><button type="button" class="btn mini" data-act="add-shift">+ Añadir turno</button>
-      <span class="small muted"> Deja las horas vacías para un día libre.</span></div>
+    <b class="small">Compromisos fijos (no cuentan como tiempo libre)</b>
+    ${state.routines.map((r, i) => `<div class="rtrow">
+      <input name="rt${i}" value="${esc(r.title)}" required maxlength="40" aria-label="Compromiso">
+      <input type="time" name="rs${i}" value="${r.start}" required aria-label="Inicio">
+      <input type="time" name="re${i}" value="${r.end}" required aria-label="Fin">
+      <label class="chk"><input type="checkbox" name="rw${i}" ${r.weekdays ? 'checked' : ''}>L–V</label>
+      <button type="button" class="icon-btn" data-act="del-routine" data-i="${i}" aria-label="Eliminar compromiso">✕</button></div>`).join('')}
+    <div><button type="button" class="btn mini" data-act="add-routine">+ Añadir compromiso</button></div>
     <hr>
     <div class="two">
+      <label>Me despierto<input type="time" name="wake" required value="${s.wake}"></label>
+      <label>Me acuesto<input type="time" name="bed" required value="${s.bed}"></label>
+      <label>Horas de comidas y otros<input type="number" name="routineH" min="0" max="10" step="0.5" required value="${s.routineH}"></label>
+      <label>Avisar antes (min)<input type="number" name="remindBefore" min="0" max="60" required value="${s.remindBefore}"></label>
       <label>Foco (min)<input type="number" name="pomo" min="5" max="120" required value="${s.pomo}"></label>
       <label>Descanso (min)<input type="number" name="brk" min="1" max="60" required value="${s.brk}"></label>
-      <label>Horas de sueño<input type="number" name="sleepH" min="0" max="14" step="0.5" required value="${s.sleepH}"></label>
-      <label>Horas de rutina (comidas, traslados)<input type="number" name="routineH" min="0" max="10" step="0.5" required value="${s.routineH}"></label>
-      <label>Avisar antes (min)<input type="number" name="remindBefore" min="0" max="60" required value="${s.remindBefore}"></label>
       <label>Hora de la revisión diaria<input type="time" name="reviewTime" value="${s.reviewTime}"></label>
     </div>
     <hr>
@@ -693,19 +895,21 @@ function settingsDialog() {
     <div class="row between"><span class="small">Copia de seguridad</span>
       <span class="row"><button type="button" class="btn mini" data-act="export">Exportar</button>
       <button type="button" class="btn mini" data-act="import">Importar</button></span></div>
-    <input type="file" id="imp" accept="application/json" hidden>
+    <input type="file" id="imp" accept="application/json,.json" hidden>
     <div class="actions"><button type="button" class="btn" data-act="close">Cancelar</button><button class="btn primary">Guardar</button></div>
   </form>`);
 }
 
 function readSettings(f) {
-  state.shiftTypes.forEach((t, i) => {
-    t.name = f.get('n' + i).trim() || t.name;
-    t.start = f.get('s' + i); t.end = f.get('e' + i); t.color = f.get('c' + i);
-    if (!t.start || !t.end) t.start = t.end = '';
+  state.routines.forEach((r, i) => {
+    r.title = f.get('rt' + i).trim() || r.title;
+    if (f.get('rs' + i) && f.get('re' + i)) { r.start = f.get('rs' + i); r.end = f.get('re' + i); }
+    r.weekdays = f.has('rw' + i);
   });
   const s = state.settings;
-  ['pomo', 'brk', 'sleepH', 'routineH', 'remindBefore'].forEach(k => { const v = Number(f.get(k)); if (!Number.isNaN(v)) s[k] = v; });
+  ['pomo', 'brk', 'routineH', 'remindBefore'].forEach(k => { const v = Number(f.get(k)); if (!Number.isNaN(v)) s[k] = v; });
+  if (f.get('wake')) s.wake = f.get('wake');
+  if (f.get('bed')) s.bed = f.get('bed');
   s.reviewTime = f.get('reviewTime');
 }
 
@@ -715,47 +919,53 @@ const findAct = id => state.activities.find(a => a.id === id);
 const findGoal = id => state.goals.find(g => g.id === id);
 
 const actions = {
-  tab(el) { ui.tab = el.dataset.tab; if (ui.tab === 'dia') ui.date = ui.date || today(); },
+  tab(el) { ui.tab = el.dataset.tab; },
   day(el) { const n = Number(el.dataset.n); ui.date = n ? addDays(ui.date, n) : today(); },
   month(el) { const [y, m] = ui.month.split('-').map(Number); ui.month = ymd(new Date(y, m - 1 + Number(el.dataset.n), 1)).slice(0, 7); },
-  paint(el) { ui.paint = ui.paint === el.dataset.id ? null : el.dataset.id; },
-  'cal-day'(el) {
-    const d = el.dataset.d;
-    if (ui.paint === 'x') delete state.days[d];
-    else if (ui.paint) state.days[d] = ui.paint;
-    else { ui.date = d; ui.tab = 'dia'; }
-  },
+  'cal-day'(el) { ui.date = el.dataset.d; ui.tab = 'dia'; },
   week(el) { ui.week = addDays(ui.week, 7 * Number(el.dataset.n)); },
+  'edit-week'() { ui.week = weekStart(ui.date); ui.month = ui.date.slice(0, 7); ui.tab = 'cal'; },
   'copy-week'() {
     for (let i = 0; i < 7; i++) {
       const v = state.days[addDays(ui.week, i - 7)], d = addDays(ui.week, i);
-      if (v) state.days[d] = typeof v === 'string' ? v : { ...v }; else delete state.days[d];
+      if (v) state.days[d] = v.map(s => ({ ...s })); else delete state.days[d];
     }
     toast('Semana anterior copiada');
   },
   'shot-pick'() { $('#shot').click(); },
   'shot-del'() { localStorage.removeItem(SHOT + ui.week); },
-  'clock-in'() { state.clock[today()] = { in: toHM(nowMin()), out: '' }; toast('Entrada registrada'); },
-  'clock-out'(el) { state.clock[el.dataset.d].out = toHM(nowMin()); toast('Salida registrada'); },
+  'clock-in'() {
+    (state.clock[today()] = state.clock[today()] || []).push({ in: toHM(nowMin()), out: '' });
+    toast('Entrada registrada');
+  },
+  'clock-out'() { const o = openClock(); if (o) { o.c.out = toHM(nowMin()); toast('Salida registrada'); } },
   'edit-clock'() {
-    const c = state.clock[ui.date] || {};
+    const list = [...clockList(ui.date), {}];
     openDlg(`<h2>Registro real del ${fmtDate(ui.date, { weekday: 'long', day: 'numeric', month: 'long' })}</h2>
     <form data-form="clock">
-      <div class="two">
-        <label>Entrada<input type="time" name="in" value="${c.in || ''}"></label>
-        <label>Salida<input type="time" name="out" value="${c.out || ''}"></label>
-      </div>
-      <p class="small muted" style="margin:0">Vacía la entrada para borrar el registro.</p>
+      ${list.map((c, i) => `<div class="two">
+        <label>Entrada<input type="time" name="in${i}" value="${c.in || ''}"></label>
+        <label>Salida<input type="time" name="out${i}" value="${c.out || ''}"></label></div>`).join('')}
+      <p class="small muted" style="margin:0">Un par por cada tramo trabajado. Vacía la entrada para borrar un registro.</p>
       <div class="actions"><button type="button" class="btn" data-act="close">Cancelar</button><button class="btn primary">Guardar</button></div>
     </form>`);
   },
-  'set-shift'(el) { if (state.days[ui.date] === el.dataset.id) delete state.days[ui.date]; else state.days[ui.date] = el.dataset.id; },
   toggle(el) { const a = findAct(el.dataset.id); a.done = !a.done; a.doneAt = a.done ? Date.now() : null; },
   'new-act'() { actDialog(newActDefaults()); },
   'edit-act'(el) { actDialog(findAct(el.dataset.id)); },
   'del-act'(el) { state.activities = state.activities.filter(a => a.id !== el.dataset.id); closeDlg(); },
   suggest() { const b = mostBehindGoal(); actDialog(newActDefaults(b && b.g)); },
   'plan-goal'(el) { actDialog(newActDefaults(findGoal(el.dataset.id))); },
+  'auto-plan'(el) {
+    const ws = addDays(weekStart(today()), 7 * Number(el.dataset.n)), n = autoPlan(ws);
+    toast(n ? `Creé ${n} bloques. Revísalos en Día y muévelos si hace falta.` : 'No encontré huecos libres o tus metas ya están repartidas esa semana.');
+  },
+  'auto-clear'() {
+    const t = today();
+    state.activities = state.activities.filter(a => !(a.auto && !a.done && a.date >= t));
+    toast('Bloques automáticos pendientes eliminados');
+  },
+  step(el) { const s = findGoal(el.dataset.id).steps.find(x => x.id === el.dataset.step); s.done = !s.done; },
   focus(el) { const a = findAct(el.dataset.id); if (state.timer) stopTimer(); startFocus({ activityId: a.id, label: a.title }); },
   'new-goal'() { goalDialog({ area: 'aprendizaje' }); },
   'edit-goal'(el) { goalDialog(findGoal(el.dataset.id)); },
@@ -779,15 +989,14 @@ const actions = {
   },
   settings() { settingsDialog(); },
   close() { closeDlg(); },
-  'add-shift'(el) {
+  'add-routine'(el) {
     readSettings(new FormData(el.form));
-    state.shiftTypes.push({ id: uid(), name: 'Nuevo turno', start: '08:00', end: '16:00', color: '#888888' });
+    state.routines.push({ id: uid(), title: 'Nuevo compromiso', start: '08:00', end: '09:00', weekdays: true });
     settingsDialog();
   },
-  'del-shift'(el) {
+  'del-routine'(el) {
     readSettings(new FormData(el.form));
-    const [gone] = state.shiftTypes.splice(Number(el.dataset.i), 1);
-    Object.keys(state.days).forEach(d => { if (state.days[d] === gone.id) delete state.days[d]; });
+    state.routines.splice(Number(el.dataset.i), 1);
     settingsDialog();
   },
   async perm() {
@@ -824,11 +1033,16 @@ const forms = {
     }
   },
   goal(f, form) {
+    const existing = findGoal(form.dataset.id), old = existing ? existing.steps : [];
+    const steps = f.get('steps').split('\n').map(l => l.trim()).filter(Boolean).map(l => {
+      const m = l.match(/^(\d{4}-\d{2}-\d{2})\s+(.+)$/);
+      const title = m ? m[2] : l, prev = old.find(s => s.title === title);
+      return { id: prev ? prev.id : uid(), title, due: m ? m[1] : '', done: prev ? prev.done : false };
+    }).sort((a, b) => (a.due || '9999').localeCompare(b.due || '9999'));
     const data = {
-      title: f.get('title').trim(), area: f.get('area'),
+      title: f.get('title').trim(), area: f.get('area'), steps,
       weeklyMin: Math.round(Number(f.get('hours')) * 60), deadline: f.get('deadline'), why: f.get('why').trim()
     };
-    const existing = findGoal(form.dataset.id);
     if (existing) {
       Object.assign(existing, data);
       state.activities.forEach(a => { if (a.goalId === existing.id) a.area = data.area; });
@@ -837,18 +1051,20 @@ const forms = {
   settings(f) { readSettings(f); },
   week(f) {
     for (let i = 0; i < 7; i++) {
-      const d = addDays(ui.week, i), s = f.get('s' + i), e = f.get('e' + i), cur = shiftOn(d);
-      if (s && e) {
-        if (hasHours(cur) && cur.start === s && cur.end === e) continue;
-        const type = state.shiftTypes.find(x => x.start === s && x.end === e);
-        state.days[d] = type ? type.id : { start: s, end: e };
-      } else if (hasHours(cur)) delete state.days[d];
+      const d = addDays(ui.week, i), list = [];
+      for (let j = 0; f.has(`s${i}_${j}`); j++) {
+        const s = f.get(`s${i}_${j}`), e = f.get(`e${i}_${j}`);
+        if (s && e && s !== e) list.push({ start: s, end: e });
+      }
+      list.sort((a, b) => toMin(a.start) - toMin(b.start));
+      if (list.length) state.days[d] = list; else delete state.days[d];
     }
     toast('Horario de la semana guardado');
   },
   clock(f) {
-    if (f.get('in')) state.clock[ui.date] = { in: f.get('in'), out: f.get('out') };
-    else delete state.clock[ui.date];
+    const list = [];
+    for (let i = 0; f.has('in' + i); i++) if (f.get('in' + i)) list.push({ in: f.get('in' + i), out: f.get('out' + i) });
+    if (list.length) state.clock[ui.date] = list; else delete state.clock[ui.date];
   },
   'free-focus'(f) {
     const goal = findGoal(f.get('goalId'));
@@ -889,7 +1105,7 @@ document.addEventListener('change', e => {
   reader.onload = () => {
     try {
       const data = JSON.parse(reader.result);
-      if (!Array.isArray(data.activities) || !Array.isArray(data.shiftTypes)) throw new Error('formato');
+      if (!Array.isArray(data.activities) || !Array.isArray(data.goals)) throw new Error('formato');
       if (!confirm('Esto reemplazará todos los datos de este dispositivo. ¿Continuar?')) return;
       localStorage.setItem(KEY, JSON.stringify(data));
       state = load();

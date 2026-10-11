@@ -165,7 +165,12 @@ input, select, textarea {
 input[type=color] { padding: 2px; height: 38px; }
 textarea { min-height: 64px; resize: vertical; }
 .two { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-.shrow { display: grid; grid-template-columns: 1.4fr 1fr 1fr 44px 34px; gap: 6px; align-items: center; }
+.rtrow { display: grid; grid-template-columns: 1.5fr 1fr 1fr auto 34px; gap: 6px; align-items: center; }
+.chk { display: flex; align-items: center; gap: 4px; white-space: nowrap; }
+.chk input, .step input { width: 20px; height: 20px; flex: none; accent-color: var(--ok); }
+.step { display: flex; align-items: center; gap: 8px; color: var(--text); font-size: .9rem; padding: 4px 0; }
+.step.done span.grow { text-decoration: line-through; color: var(--muted); }
+details summary { cursor: pointer; padding: 6px 0; }
 .wkrow { display: grid; grid-template-columns: 1fr 1.2fr 1.2fr; gap: 8px; align-items: center; }
 .wkrow span:first-child { text-transform: capitalize; }
 .shot { max-height: 60vh; overflow: auto; border: 1px solid var(--line); border-radius: 10px; }
