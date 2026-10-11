@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#1f6feb">
+  <title>Enfoque Diario</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icon.svg">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="top">
+    <h1>Enfoque Diario</h1>
+    <button class="icon-btn" data-act="settings" aria-label="Ajustes">⚙</button>
+  </header>
+
+  <main id="view"></main>
+
+  <nav class="tabs">
+    <button data-act="tab" data-tab="dia"><span>◷</span>Día</button>
+    <button data-act="tab" data-tab="cal"><span>▦</span>Calendario</button>
+    <button data-act="tab" data-tab="foco"><span>◎</span>Foco</button>
+    <button data-act="tab" data-tab="metas"><span>⚑</span>Metas</button>
+    <button data-act="tab" data-tab="prog"><span>▮</span>Progreso</button>
+  </nav>
+
+  <dialog id="dlg"></dialog>
+  <input type="file" id="shot" accept="image/*" hidden>
+  <div id="toast" role="status" aria-live="polite"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
