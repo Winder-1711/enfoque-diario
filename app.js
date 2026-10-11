@@ -17,7 +17,7 @@ const DEFAULTS = () => ({
   clock: {},       // fecha de entrada -> registros reales [{in:'HH:MM', out:'HH:MM'}]
   routines: [],    // compromisos fijos: {id,title,start,end,weekdays}
   activities: [],  // {id,date,start,end,title,area,goalId,done,doneAt,focusMin,auto}
-  goals: [],       // {id,title,area,weeklyMin,deadline,why,steps:[{id,title,due,done}]}
+  goals: [],       // {id,title,area,weeklyMin,deadline,why,block,blockMin,weekdaysOnly,from,to,steps:[{id,title,due,done}]}
   looseFocus: [],  // foco sin actividad: {date,min,goalId,area}
   reviews: {},     // fecha -> {good,blocked,tomorrow,energy}
   pomos: {},       // fecha -> pomodoros completados
@@ -211,7 +211,20 @@ function mostBehindGoal() {
     .sort((a, b) => b.left / b.g.weeklyMin - a.left / a.g.weeklyMin)[0];
 }
 
-// Reparte las horas semanales de cada meta en los huecos libres de la semana: un bloque de hasta 90 min por meta y día.
+// Primer hueco libre del día que sirve para una meta, respetando su franja horaria y sus días (si los tiene).
+function slotFor(g, date) {
+  const wd = parseYmd(date).getDay();
+  if (g && g.weekdaysOnly && (wd === 0 || wd === 6)) return null;
+  const lo = g && g.from ? toMin(g.from) : 0, hi = g && g.to ? toMin(g.to) : 1440;
+  for (const s of freeSlots(date)) {
+    const start = Math.max(s.start, lo), end = Math.min(s.end, hi);
+    if (end - start >= 30) return { start, end };
+  }
+  return null;
+}
+
+// Reparte las horas semanales de cada meta en los huecos libres de la semana: un bloque por meta y día.
+// Las metas con franja horaria van primero, porque tienen menos huecos donde caber.
 function autoPlan(ws) {
   const t = today();
   const left = state.goals.map(g => ({
@@ -219,24 +232,32 @@ function autoPlan(ws) {
     left: g.weeklyMin - goalMinutes(g.id, ws)
       - state.activities.filter(a => a.goalId === g.id && !a.done && inWeek(a.date, ws) && a.date >= t).reduce((s, a) => s + dur(a), 0)
   }));
+  const days = [...Array(7)].map((_, i) => addDays(ws, i)).filter(d => d >= t);
+  const unplanned = d => freeMin(d) - actsOn(d).reduce((s, a) => s + dur(a), 0);
   let n = 0;
-  for (let i = 0; i < 7; i++) {
-    const d = addDays(ws, i);
-    if (d < t) continue;
-    left.sort((a, b) => b.left - a.left);
-    for (const x of left) {
-      if (x.left < 30 || state.activities.some(a => a.date === d && a.goalId === x.g.id)) continue;
-      const slot = freeSlots(d)[0];
-      if (!slot) break;
-      const len = Math.floor(Math.min(90, x.left, slot.end - slot.start) / 5) * 5;
-      if (len < 30) continue;
-      state.activities.push({
-        id: uid(), date: d, start: toHM(slot.start), end: toHM(slot.start + len), title: x.g.title,
-        area: x.g.area, goalId: x.g.id, done: false, doneAt: null, focusMin: 0, auto: true
-      });
-      x.left -= len;
-      n++;
-    }
+  const place = (x, d) => {
+    if (x.left < 30 || state.activities.some(a => a.date === d && a.goalId === x.g.id)) return false;
+    const slot = slotFor(x.g, d);
+    if (!slot) return false;
+    const len = Math.floor(Math.min(x.g.blockMin || 90, x.left, slot.end - slot.start) / 5) * 5;
+    if (len < 30) return false;
+    state.activities.push({
+      id: uid(), date: d, start: toHM(slot.start), end: toHM(slot.start + len), title: x.g.block || x.g.title,
+      area: x.g.area, goalId: x.g.id, done: false, doneAt: null, focusMin: 0, auto: true
+    });
+    x.left -= len;
+    n++;
+    return true;
+  };
+  const fixed = x => x.g.from || x.g.to || x.g.weekdaysOnly;
+  days.forEach(d => left.filter(fixed).forEach(x => place(x, d)));
+  // El resto va siempre al día con más tiempo libre sin planificar, para no cargar los días de más trabajo.
+  const rest = left.filter(x => !fixed(x));
+  for (let placed = true; placed;) {
+    placed = false;
+    rest.sort((a, b) => b.left - a.left).forEach(x => {
+      if (days.slice().sort((a, b) => unplanned(b) - unplanned(a)).some(d => place(x, d))) placed = true;
+    });
   }
   return n;
 }
@@ -359,7 +380,7 @@ function saveShot(file) {
         ui.month = dates[0].slice(0, 7);
         const odd = dates.some(d => found[d].some(s => span(s) > 600));
         msg = `Leí ${dates.reduce((t, d) => t + found[d].length, 0)} tramos en ${dates.length} días. `
-          + (odd ? 'Hay un tramo de más de 10 h: seguramente leí mal una hora, corrígela abajo.' : 'Revísalos abajo y corrige si hace falta.');
+          + (odd ? 'Hay un tramo de más de 10 h: seguramente leí mal una hora, corrígela abajo.' : 'Revísalos abajo y luego reparte tus metas en la pestaña Metas.');
         save();
       }
     } catch (e) { msg = 'Captura guardada. La lectura automática necesita conexión a internet; copia las horas a mano.'; }
@@ -730,6 +751,7 @@ function viewMetas() {
       <p class="small" style="margin:10px 0 6px">Reto de esta semana: <b>${fmtDur(done)}</b> de ${fmtDur(g.weeklyMin)}</p>
       ${bar(done / g.weeklyMin, areaColor(g.area))}
       <p class="small" style="margin:8px 0 0">${left ? `Mini-meta de hoy: <b>${fmtDur(Math.ceil(left / daysLeft))}</b> (${daysLeft > 1 ? `quedan ${daysLeft} días` : 'último día'} de la semana).` : '<span class="tag ok">¡Reto semanal cumplido!</span>'}</p>
+      <p class="small muted" style="margin:4px 0 0">Bloques de ${fmtDur(g.blockMin || 90)}${g.block ? ` · ${esc(g.block)}` : ''}${g.weekdaysOnly ? ' · lunes a viernes' : ''}${g.from || g.to ? ` · entre ${g.from || '00:00'} y ${g.to || '24:00'}` : ''}</p>
       ${g.steps.length ? `<hr><p class="small" style="margin:0 0 6px"><b>Siguiente paso</b> · ${stepsDone}/${g.steps.length} completados</p>
         ${next ? stepRow(g, next) : '<span class="tag ok">¡Todos los pasos completados!</span>'}
         <details><summary class="small muted">Ver todos los pasos</summary>${g.steps.map(s => stepRow(g, s)).join('')}</details>` : ''}
@@ -841,9 +863,9 @@ function actDialog(a) {
 
 function newActDefaults(goal) {
   const date = ui.tab === 'dia' && ui.date >= today() ? ui.date : today();
-  const free = freeSlots(date)[0];
-  const slot = free ? { start: free.start, end: Math.min(free.end, free.start + 60) } : { start: 1080, end: 1140 };
-  return { date, start: toHM(slot.start), end: toHM(slot.end), title: goal ? goal.title : '', goalId: goal ? goal.id : '', area: goal ? goal.area : 'aprendizaje' };
+  const free = slotFor(goal, date), max = (goal && goal.blockMin) || 60;
+  const slot = free ? { start: free.start, end: Math.min(free.end, free.start + max) } : { start: 1080, end: 1140 };
+  return { date, start: toHM(slot.start), end: toHM(slot.end), title: goal ? goal.block || goal.title : '', goalId: goal ? goal.id : '', area: goal ? goal.area : 'aprendizaje' };
 }
 
 function goalDialog(g) {
@@ -856,6 +878,13 @@ function goalDialog(g) {
     <label>Horas por semana que te comprometes a dedicar<input type="number" name="hours" required min="0.5" max="80" step="0.5" value="${(g.weeklyMin || 180) / 60}"></label>
     <label>Fecha objetivo (opcional)<input type="date" name="deadline" value="${g.deadline || ''}"></label>
     <label>¿Para qué la quieres lograr? (opcional)<input name="why" maxlength="140" value="${esc(g.why)}"></label>
+    <label>Qué haces en cada bloque (opcional)<input name="block" maxlength="60" value="${esc(g.block)}" placeholder="Ej. Visitar 2–3 clínicas"></label>
+    <div class="two">
+      <label>Duración del bloque (min)<input type="number" name="blockMin" min="30" max="240" step="5" required value="${g.blockMin || 90}"></label>
+      <label class="chk" style="align-self:end;padding-bottom:8px"><input type="checkbox" name="weekdaysOnly" ${g.weekdaysOnly ? 'checked' : ''}>Solo de lunes a viernes</label>
+      <label>Solo desde las (opcional)<input type="time" name="from" value="${g.from || ''}"></label>
+      <label>Solo hasta las (opcional)<input type="time" name="to" value="${g.to || ''}"></label>
+    </div>
     <label>Pasos, uno por línea. Fecha opcional al inicio (AAAA-MM-DD)<textarea name="steps" rows="6" placeholder="2026-11-30 Terminar el curso básico">${esc(steps)}</textarea></label>
     <div class="actions">
       ${isNew ? '' : `<button type="button" class="btn danger" data-act="del-goal" data-id="${g.id}">Eliminar</button>`}
@@ -1041,6 +1070,8 @@ const forms = {
     }).sort((a, b) => (a.due || '9999').localeCompare(b.due || '9999'));
     const data = {
       title: f.get('title').trim(), area: f.get('area'), steps,
+      block: f.get('block').trim(), blockMin: Number(f.get('blockMin')) || 90,
+      weekdaysOnly: f.has('weekdaysOnly'), from: f.get('from'), to: f.get('to'),
       weeklyMin: Math.round(Number(f.get('hours')) * 60), deadline: f.get('deadline'), why: f.get('why').trim()
     };
     if (existing) {
