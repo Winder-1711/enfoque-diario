@@ -171,6 +171,11 @@ textarea { min-height: 64px; resize: vertical; }
 .step { display: flex; align-items: center; gap: 8px; color: var(--text); font-size: .9rem; padding: 4px 0; }
 .step.done span.grow { text-decoration: line-through; color: var(--muted); }
 details summary { cursor: pointer; padding: 6px 0; }
+.visit { display: flex; align-items: flex-start; gap: 10px; padding: 10px 0; border-top: 1px solid var(--line); }
+.visit .t { font-weight: 600; overflow-wrap: anywhere; }
+.visit.done .t { color: var(--muted); }
+.visit select { width: auto; flex: none; max-width: 8.5rem; font-size: .85rem; }
+.visit a { color: var(--accent); }
 .wkrow { display: grid; grid-template-columns: 1fr 1.2fr 1.2fr; gap: 8px; align-items: center; }
 .wkrow span:first-child { text-transform: capitalize; }
 .shot { max-height: 60vh; overflow: auto; border: 1px solid var(--line); border-radius: 10px; }

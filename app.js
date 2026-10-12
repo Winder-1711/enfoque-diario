@@ -11,6 +11,9 @@ const AREAS = {
   otro: { name: 'Otro', color: '#8a8f98' }
 };
 
+// El primer estado es "pendiente de visitar"; cualquier otro cuenta como visita hecha.
+const VISIT_STATUS = ['Sin tocar', 'Visitada', 'Interesada', 'Demo hecha', 'Cliente', 'Descartada'];
+
 const DEFAULTS = () => ({
   settings: { pomo: 25, brk: 5, wake: '08:00', bed: '23:30', routineH: 2, remindBefore: 5, reviewTime: '21:30' },
   days: {},        // 'YYYY-MM-DD' -> tramos de trabajo programados [{start,end}]
@@ -18,6 +21,7 @@ const DEFAULTS = () => ({
   routines: [],    // compromisos fijos: {id,title,start,end,weekdays}
   activities: [],  // {id,date,start,end,title,area,goalId,done,doneAt,focusMin,auto}
   goals: [],       // {id,title,area,weeklyMin,deadline,why,block,blockMin,weekdaysOnly,from,to,steps:[{id,title,due,done}]}
+  visits: [],      // lugares por visitar: {id,name,zone,addr,phone,reviews,status,notes,visitedAt}
   looseFocus: [],  // foco sin actividad: {date,min,goalId,area}
   reviews: {},     // fecha -> {good,blocked,tomorrow,energy}
   pomos: {},       // fecha -> pomodoros completados
@@ -216,9 +220,13 @@ function slotFor(g, date) {
   const wd = parseYmd(date).getDay();
   if (g && g.weekdaysOnly && (wd === 0 || wd === 6)) return null;
   const lo = g && g.from ? toMin(g.from) : 0, hi = g && g.to ? toMin(g.to) : 1440;
+  // Con una pausa a evitar (p. ej. el mediodía) la franja se parte en dos.
+  const windows = g && g.skipFrom && g.skipTo ? [[lo, toMin(g.skipFrom)], [toMin(g.skipTo), hi]] : [[lo, hi]];
   for (const s of freeSlots(date)) {
-    const start = Math.max(s.start, lo), end = Math.min(s.end, hi);
-    if (end - start >= 30) return { start, end };
+    for (const [a, b] of windows) {
+      const start = Math.max(s.start, a), end = Math.min(s.end, b);
+      if (end - start >= 30) return { start, end };
+    }
   }
   return null;
 }
@@ -521,6 +529,59 @@ const areaChip = k => `<span class="chip"><i style="background:${areaColor(k)}">
 const bar = (pct, color) => `<div class="bar"><i style="width:${Math.min(100, Math.round(pct * 100))}%;${color ? `background:${color}` : ''}"></i></div>`;
 const shortT = t => (t.endsWith(':00') ? String(+t.slice(0, 2)) : +t.slice(0, 2) + t.slice(2));
 
+const visitPending = v => v.status === VISIT_STATUS[0];
+// Las siguientes visitas: las primeras pendientes de la zona que toca, para ir andando de una a otra.
+function nextVisits() {
+  const pending = state.visits.filter(visitPending);
+  return pending.filter(v => v.zone === pending[0].zone).slice(0, 3);
+}
+function visitRow(v) {
+  const q = encodeURIComponent(`${v.name} ${v.addr} Valencia`);
+  return `<div class="visit ${visitPending(v) ? '' : 'done'}">
+    <div class="grow"><div class="t">${esc(v.name)}</div>
+      <div class="small muted">${esc(v.addr)}${v.reviews ? ` · ${v.reviews} reseñas` : ''}</div>
+      ${v.notes ? `<div class="small muted">${esc(v.notes)}</div>` : ''}
+      <div class="row small" style="margin-top:4px">
+        <a href="https://www.google.com/maps/search/?api=1&query=${q}" target="_blank" rel="noopener">Mapa</a>
+        ${v.phone ? `<a href="tel:${esc(v.phone.replace(/\s/g, ''))}">${esc(v.phone)}</a>` : ''}
+        <button class="btn mini" data-act="edit-visit" data-id="${v.id}">Editar</button></div></div>
+    <select data-change="visit-status" data-id="${v.id}" aria-label="Estado de la visita">
+      ${VISIT_STATUS.map(s => `<option ${v.status === s ? 'selected' : ''}>${s}</option>`).join('')}</select></div>`;
+}
+function visitsCard() {
+  const ws = weekStart(today()), done = state.visits.filter(v => !visitPending(v));
+  const week = done.filter(v => v.visitedAt && inWeek(v.visitedAt, ws)).length;
+  const zones = [...new Set(state.visits.map(v => v.zone))];
+  const first = (state.visits.find(visitPending) || {}).zone;
+  return `<section class="card">
+    <div class="row between"><h2 style="margin:0">Lista de visitas</h2><button class="btn primary mini" data-act="new-visit">+ Lugar</button></div>
+    ${state.visits.length ? `<p class="small muted" style="margin:8px 0">${done.length} de ${state.visits.length} visitadas · ${week} esta semana</p>`
+      : '<p class="small muted" style="margin:8px 0 0">Añade los lugares que quieres visitar (clientes, clínicas…) y marca cómo fue cada visita.</p>'}
+    ${zones.map(z => {
+      const list = state.visits.filter(v => v.zone === z);
+      return `<details ${z === first ? 'open' : ''}><summary><b>${esc(z || 'Sin zona')}</b> · ${list.filter(visitPending).length} pendientes de ${list.length}</summary>
+        ${list.map(visitRow).join('')}</details>`;
+    }).join('')}
+  </section>`;
+}
+function visitDialog(v) {
+  openDlg(`<h2>${v.id ? 'Editar lugar' : 'Nuevo lugar'}</h2>
+  <form data-form="visit" data-id="${v.id || ''}">
+    <label>Nombre<input name="name" required maxlength="80" value="${esc(v.name)}"></label>
+    <div class="two">
+      <label>Zona o barrio<input name="zone" maxlength="40" value="${esc(v.zone)}"></label>
+      <label>Teléfono<input name="phone" maxlength="20" value="${esc(v.phone)}"></label>
+    </div>
+    <label>Dirección<input name="addr" maxlength="100" value="${esc(v.addr)}"></label>
+    <label>Notas (con quién hablé, horario, siguiente paso…)<textarea name="notes" maxlength="500">${esc(v.notes)}</textarea></label>
+    <div class="actions">
+      ${v.id ? `<button type="button" class="btn danger" data-act="del-visit" data-id="${v.id}">Eliminar</button>` : ''}
+      <button type="button" class="btn" data-act="close">Cancelar</button>
+      <button class="btn primary">Guardar</button>
+    </div>
+  </form>`);
+}
+
 function viewDia() {
   const d = ui.date, isToday = d === today(), now = nowMin();
   const acts = actsOn(d), shifts = shiftsOn(d);
@@ -549,6 +610,9 @@ function viewDia() {
     })
   ].sort((a, b) => a.start - b.start);
 
+  // La lista de visitas se muestra los días con un bloque pendiente de una meta de negocio.
+  const visitsToday = d >= today() && state.visits.some(visitPending)
+    && acts.some(a => !a.done && (findGoal(a.goalId) || {}).area === 'negocio');
   const behind = mostBehindGoal(), unplanned = free - planned;
   let tip = '';
   if (d >= today()) {
@@ -608,7 +672,8 @@ function viewDia() {
       <button class="btn primary mini" data-act="new-act">+ Actividad</button>
     </div>
     ${items.length ? `<ul class="tl">${items.map(i => i.html).join('')}</ul>` : '<p class="muted small">Nada programado. Añade tu primera actividad del día.</p>'}
-  </section>`;
+  </section>
+  ${visitsToday ? `<section class="card"><h2>Próximas visitas · ${esc(nextVisits()[0].zone)}</h2>${nextVisits().map(visitRow).join('')}</section>` : ''}`;
 }
 
 function viewCal() {
@@ -751,7 +816,7 @@ function viewMetas() {
       <p class="small" style="margin:10px 0 6px">Reto de esta semana: <b>${fmtDur(done)}</b> de ${fmtDur(g.weeklyMin)}</p>
       ${bar(done / g.weeklyMin, areaColor(g.area))}
       <p class="small" style="margin:8px 0 0">${left ? `Mini-meta de hoy: <b>${fmtDur(Math.ceil(left / daysLeft))}</b> (${daysLeft > 1 ? `quedan ${daysLeft} días` : 'último día'} de la semana).` : '<span class="tag ok">¡Reto semanal cumplido!</span>'}</p>
-      <p class="small muted" style="margin:4px 0 0">Bloques de ${fmtDur(g.blockMin || 90)}${g.block ? ` · ${esc(g.block)}` : ''}${g.weekdaysOnly ? ' · lunes a viernes' : ''}${g.from || g.to ? ` · entre ${g.from || '00:00'} y ${g.to || '24:00'}` : ''}</p>
+      <p class="small muted" style="margin:4px 0 0">Bloques de ${fmtDur(g.blockMin || 90)}${g.block ? ` · ${esc(g.block)}` : ''}${g.weekdaysOnly ? ' · lunes a viernes' : ''}${g.from || g.to ? ` · entre ${g.from || '00:00'} y ${g.to || '24:00'}` : ''}${g.skipFrom && g.skipTo ? ` · evitando ${g.skipFrom}–${g.skipTo}` : ''}</p>
       ${g.steps.length ? `<hr><p class="small" style="margin:0 0 6px"><b>Siguiente paso</b> · ${stepsDone}/${g.steps.length} completados</p>
         ${next ? stepRow(g, next) : '<span class="tag ok">¡Todos los pasos completados!</span>'}
         <details><summary class="small muted">Ver todos los pasos</summary>${g.steps.map(s => stepRow(g, s)).join('')}</details>` : ''}
@@ -774,7 +839,8 @@ function viewMetas() {
       ${autos ? `<button class="btn mini danger" data-act="auto-clear">Quitar ${autos} bloques automáticos</button>` : ''}
     </div>` : ''}
   </section>
-  ${cards || '<section class="card"><p class="small" style="margin:0">Empieza con una sola meta, la que más te acerque a tu propósito.</p></section>'}`;
+  ${cards || '<section class="card"><p class="small" style="margin:0">Empieza con una sola meta, la que más te acerque a tu propósito.</p></section>'}
+  ${visitsCard()}`;
 }
 
 function viewProg() {
@@ -884,6 +950,8 @@ function goalDialog(g) {
       <label class="chk" style="align-self:end;padding-bottom:8px"><input type="checkbox" name="weekdaysOnly" ${g.weekdaysOnly ? 'checked' : ''}>Solo de lunes a viernes</label>
       <label>Solo desde las (opcional)<input type="time" name="from" value="${g.from || ''}"></label>
       <label>Solo hasta las (opcional)<input type="time" name="to" value="${g.to || ''}"></label>
+      <label>Evitar desde (opcional)<input type="time" name="skipFrom" value="${g.skipFrom || ''}"></label>
+      <label>Evitar hasta (opcional)<input type="time" name="skipTo" value="${g.skipTo || ''}"></label>
     </div>
     <label>Pasos, uno por línea. Fecha opcional al inicio (AAAA-MM-DD)<textarea name="steps" rows="6" placeholder="2026-11-30 Terminar el curso básico">${esc(steps)}</textarea></label>
     <div class="actions">
@@ -994,6 +1062,9 @@ const actions = {
     state.activities = state.activities.filter(a => !(a.auto && !a.done && a.date >= t));
     toast('Bloques automáticos pendientes eliminados');
   },
+  'new-visit'() { visitDialog({ zone: (state.visits.find(visitPending) || {}).zone || '' }); },
+  'edit-visit'(el) { visitDialog(state.visits.find(v => v.id === el.dataset.id)); },
+  'del-visit'(el) { state.visits = state.visits.filter(v => v.id !== el.dataset.id); closeDlg(); },
   step(el) { const s = findGoal(el.dataset.id).steps.find(x => x.id === el.dataset.step); s.done = !s.done; },
   focus(el) { const a = findAct(el.dataset.id); if (state.timer) stopTimer(); startFocus({ activityId: a.id, label: a.title }); },
   'new-goal'() { goalDialog({ area: 'aprendizaje' }); },
@@ -1072,6 +1143,7 @@ const forms = {
       title: f.get('title').trim(), area: f.get('area'), steps,
       block: f.get('block').trim(), blockMin: Number(f.get('blockMin')) || 90,
       weekdaysOnly: f.has('weekdaysOnly'), from: f.get('from'), to: f.get('to'),
+      skipFrom: f.get('skipFrom'), skipTo: f.get('skipTo'),
       weeklyMin: Math.round(Number(f.get('hours')) * 60), deadline: f.get('deadline'), why: f.get('why').trim()
     };
     if (existing) {
@@ -1080,6 +1152,12 @@ const forms = {
     } else state.goals.push({ ...data, id: uid(), created: today() });
   },
   settings(f) { readSettings(f); },
+  visit(f, form) {
+    const data = { name: f.get('name').trim(), zone: f.get('zone').trim(), phone: f.get('phone').trim(), addr: f.get('addr').trim(), notes: f.get('notes').trim() };
+    const existing = state.visits.find(v => v.id === form.dataset.id);
+    if (existing) Object.assign(existing, data);
+    else state.visits.push({ ...data, id: uid(), reviews: 0, status: VISIT_STATUS[0], visitedAt: '' });
+  },
   week(f) {
     for (let i = 0; i < 7; i++) {
       const d = addDays(ui.week, i), list = [];
@@ -1130,6 +1208,13 @@ document.addEventListener('paste', e => {
 });
 
 document.addEventListener('change', e => {
+  if (e.target.dataset.change === 'visit-status') {
+    const v = state.visits.find(x => x.id === e.target.dataset.id);
+    v.status = e.target.value;
+    v.visitedAt = visitPending(v) ? '' : today();
+    save(); render();
+    return;
+  }
   if (e.target.id === 'shot' && e.target.files[0]) { saveShot(e.target.files[0]); e.target.value = ''; return; }
   if (e.target.id !== 'imp' || !e.target.files[0]) return;
   const reader = new FileReader();
